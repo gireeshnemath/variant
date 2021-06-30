@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
+	"net/http"
 	"strconv"
 	"sync"
 
@@ -12,6 +13,8 @@ import (
 	"code.cloudfoundry.org/cli/api/cloudcontroller/ccv3"
 	"code.cloudfoundry.org/cli/resources"
 	clients "github.com/cloudfoundry-community/go-cf-clients-helper"
+	"github.com/percona/promconfig"
+	"gopkg.in/yaml.v2"
 )
 
 const (
@@ -23,15 +26,17 @@ type Config struct {
 	PrometheusConfig string
 	InternalDomainID string
 	ThanosID         string
+	ThanosURL        string
 }
 
 type Timeline struct {
 	sync.Mutex
 	*clients.Session
-	targets    []ScrapeEndpoint
-	Selectors  []string
-	startState []cfnetv1.Policy
-	config     Config
+	targets     []promconfig.ScrapeConfig
+	Selectors   []string
+	startState  []cfnetv1.Policy
+	startConfig string
+	config      Config
 }
 
 type ScrapeEndpoint struct {
@@ -52,11 +57,36 @@ func NewTimeline(config Config, selectors []string) (*Timeline, error) {
 		Selectors: selectors,
 		config:    config,
 	}
+	data, err := ioutil.ReadFile(config.PrometheusConfig)
+	if err != nil {
+		return nil, fmt.Errorf("read promethues config: %w", err)
+	}
+	var cfg promconfig.Config
+	err = yaml.Unmarshal(data, &cfg)
+
+	//cfg, err := promconfig.Load(string(data))
+	if err != nil {
+		return nil, fmt.Errorf("load prometheus config: %w", err)
+	}
+	timeline.startConfig = string(data)
 	timeline.startState = timeline.getCurrentPolicies()
 	return timeline, nil
 }
 
-// Reconcile manages the network-polices
+func (t *Timeline) saveAndReload(newConfig string) error {
+	if err := ioutil.WriteFile(t.config.PrometheusConfig, []byte(newConfig), 0644); err != nil {
+		return fmt.Errorf("save config: %w", err)
+	}
+	resp, err := http.Post(t.config.ThanosURL+"/-/reload", "application/json", nil)
+	if err != nil {
+		return fmt.Errorf("reload config: %w", err)
+	}
+	_, err = ioutil.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	return err
+}
+
+// Reconcile calculates and applies network-polices and scrap configs
 func (t *Timeline) Reconcile() error {
 	t.Lock()
 	defer t.Unlock()
@@ -72,14 +102,15 @@ func (t *Timeline) Reconcile() error {
 	fmt.Printf("found %d matching selectors\n", len(apps))
 
 	// Determine the desired state
-	var targets []ScrapeEndpoint
+	var configs []promconfig.ScrapeConfig
 	var generatedPolicies []cfnetv1.Policy
 	for _, app := range apps {
-		// Erase an app from startTime if it show up on the timeline
+		// Erase app from startTime if it show up on the timeline
 		t.startState = prunePoliciesByDestination(t.startState, app.GUID)
-		policies, endpoints, _ := t.generatePoliciesAndEndpoints(app)
+		// Calculate policies and scrape_config sections for app
+		policies, endpoints, _ := t.generatePoliciesAndScrapeConfigs(app)
 		generatedPolicies = append(generatedPolicies, policies...)
-		targets = append(targets, endpoints...)
+		configs = append(configs, endpoints...)
 	}
 	desiredState := uniqPolicies(append(t.startState, generatedPolicies...))
 	currentState := t.getCurrentPolicies()
@@ -126,45 +157,110 @@ func (t *Timeline) Reconcile() error {
 			fmt.Printf("error creating: %v\n", err)
 		}
 	}
-	t.targets = targets // Refresh the targets list
+	t.targets = configs // Refresh the targets list
+
+	// Generate new config
+	var newCfg promconfig.Config
+
+	err = yaml.Unmarshal([]byte(t.startConfig), &newCfg)
+	if err != nil {
+		return fmt.Errorf("loading config: %w", err)
+	}
+	for _, cfg := range configs {
+		n := cfg
+		newCfg.ScrapeConfigs = append(newCfg.ScrapeConfigs, &n)
+	}
+	output, err := yaml.Marshal(newCfg)
+	if err != nil {
+		return err
+	}
+	err = t.saveAndReload(string(output))
+	if err != nil {
+		return err
+	}
+	fmt.Printf("---config start---\n%s\n---config end---\n", string(output))
 	return nil
 }
 
-func (t *Timeline) Targets() []ScrapeEndpoint {
+func (t *Timeline) Targets() []promconfig.ScrapeConfig {
 	t.Lock()
 	targets := t.targets
 	defer t.Unlock()
 	return targets
 }
 
-func (t *Timeline) generatePoliciesAndEndpoints(app resources.Application) ([]cfnetv1.Policy, []ScrapeEndpoint, error) {
+func (t *Timeline) generatePoliciesAndScrapeConfigs(app resources.Application) ([]cfnetv1.Policy, []promconfig.ScrapeConfig, error) {
 	var policies []cfnetv1.Policy
-	var endpoints []ScrapeEndpoint
+	var configs []promconfig.ScrapeConfig
 
 	metadata, err := t.metadataRetrieve(appMetadata, app.GUID)
 	if err != nil {
-		return policies, endpoints, fmt.Errorf("metadataRetrieve: %w", err)
+		return policies, configs, fmt.Errorf("metadataRetrieve: %w", err)
 	}
+	portNumber := 9090 // Default
 	if port := metadata.Annotations["prometheus.exporter.port"]; port != nil {
-		portNumber, err := strconv.Atoi(*port)
+		portNumber, err = strconv.Atoi(*port)
 		if err != nil {
-			return policies, endpoints, err
+			return policies, configs, err
 		}
-		policies = append(policies, t.newPolicy(app.GUID, portNumber))
 	}
-	if port := metadata.Annotations["prometheus.discovery.port"]; port != nil {
-		portNumber, err := strconv.Atoi(*port)
+	scrapePath := "/metrics" // Default
+	if path := metadata.Annotations["prometheus.exporter.path"]; path != nil {
+		scrapePath = *path
+	}
+	policies = append(policies, t.newPolicy(app.GUID, portNumber))
+	internalHost, err := t.internalHost(app)
+	if err != nil {
+		return policies, configs, err
+	}
+	targetHost := fmt.Sprintf("%s:%d", internalHost, portNumber)
+	scrapeConfig := promconfig.ScrapeConfig{
+		JobName:         fmt.Sprintf("%s-exporter", app.Name),
+		HonorTimestamps: true,
+		Scheme:          "http",
+		MetricsPath:     scrapePath,
+		ServiceDiscoveryConfig: promconfig.ServiceDiscoveryConfig{
+			StaticConfigs: []*promconfig.Group{
+				{
+					Targets: []string{
+						targetHost,
+					},
+				},
+			},
+		},
+	}
+	if port := metadata.Annotations["prometheus.targets.port"]; port != nil {
+		targetsPort, err := strconv.Atoi(*port)
 		if err != nil {
-			return policies, endpoints, err
+			return policies, configs, err
 		}
-		policies = append(policies, t.newPolicy(app.GUID, portNumber))
-		endpoints = append(endpoints, ScrapeEndpoint{
-			Host: app.GUID,
-			Port: portNumber,
-			Path: "/targets", // Hardcoded for now
-		})
+		targetsPath := "/targets"
+		if path := metadata.Annotations["prometheus.targets.path"]; path != nil {
+			targetsPath = *path
+		}
+		targetsURL := fmt.Sprintf("http://%s:%d%s", internalHost, targetsPort, targetsPath)
+		policies = append(policies, t.newPolicy(app.GUID, targetsPort))
+		scrapeConfig.RelabelConfigs = append(scrapeConfig.RelabelConfigs,
+			&promconfig.RelabelConfig{
+				SourceLabels: []string{"__address__"},
+				TargetLabel:  "__param_target",
+			},
+			&promconfig.RelabelConfig{
+				SourceLabels: []string{"__param_target"},
+				TargetLabel:  "instance",
+			},
+			&promconfig.RelabelConfig{
+				Replacement: targetHost,
+				TargetLabel: "__address__",
+			})
+		scrapeConfig.ServiceDiscoveryConfig = promconfig.ServiceDiscoveryConfig{
+			HTTPSDConfigs: []*promconfig.HTTPSDConfig{
+				{URL: targetsURL},
+			},
+		}
 	}
-	return policies, endpoints, nil
+	configs = append(configs, scrapeConfig)
+	return policies, configs, nil
 }
 
 func (t *Timeline) getCurrentPolicies() []cfnetv1.Policy {
